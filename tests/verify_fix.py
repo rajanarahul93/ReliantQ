@@ -13,8 +13,8 @@ from app.models import Base, Job, JobStatus, DeadLetterJob
 from app.tasks.process_job import process_job
 
 # 1. SETUP MOCKED ENVIRONMENT
-# Use SQLite for atomic verification of session logic
-SQLALCHEMY_DATABASE_URL = "sqlite:///./temp_verify.db"
+# Use in-memory SQLite for atomic verification of session logic
+SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -34,8 +34,6 @@ def setup_function():
 
 def teardown_function():
     Base.metadata.drop_all(bind=engine)
-    if os.path.exists("./temp_verify.db"):
-        os.remove("./temp_verify.db")
 
 def test_success_flow():
     """Validates: PENDING -> PROCESSING -> SUCCESS"""
@@ -55,8 +53,15 @@ def test_success_flow():
     db.commit()
     db.close()
     
-    # Run the task
-    process_job(mock_self, str(job_id))
+    # Initialize the mock properties on the task instance itself
+    process_job.max_retries = 3
+    # Use a custom Exception for Retry to match naming convention in celery
+    class MockRetry(Exception): pass
+    process_job.Retry = MockRetry
+    process_job.retry = MagicMock(side_effect=MockRetry("Celery Retry Triggered"))
+    
+    # Run the task directly (it's already bound to process_job, so only 1 arg needed)
+    process_job.run(str(job_id))
     
     # Verify final state
     db = TestingSessionLocal()
@@ -86,7 +91,7 @@ def test_failure_and_retry_flow():
     
     # Run the task (it should raise Exception from mock_self.retry)
     with pytest.raises(Exception, match="Celery Retry Triggered"):
-        process_job(mock_self, str(job_id))
+        process_job.run(str(job_id))
     
     # Verify retry state
     db = TestingSessionLocal()
@@ -116,7 +121,7 @@ def test_dlq_transition():
     
     # Run the task (it should raise Exception from mock_self.retry)
     with pytest.raises(Exception, match="Celery Retry Triggered"):
-        process_job(mock_self, str(job_id))
+        process_job.run(str(job_id))
     
     # Verify DLQ state
     db = TestingSessionLocal()
