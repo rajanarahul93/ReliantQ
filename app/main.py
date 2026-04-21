@@ -1,7 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import select, insert, update
-from app import models, schemas, database, worker
+from app import models, schemas, database
+from app.celery_app import celery_app
 from app.config import settings
 import logging
 import redis
@@ -80,11 +81,20 @@ def submit_job(job_in: schemas.JobCreate, db: Session = Depends(database.get_db)
             detail="Queue is full. Please try again later."
         )
 
-    # 2. Idempotency Check (Find or Create)
-    existing_job = db.query(models.Job).filter(models.Job.idempotency_key == job_in.idempotency_key).first()
+    # 2. Idempotency Check (Strict Fresh Read)
+    # Use one_or_none to search for existing job in the current session
+    existing_job = db.query(models.Job).filter(models.Job.idempotency_key == job_in.idempotency_key).one_or_none()
+    
     if existing_job:
-        logger.info(f"Duplicate job submission for key: {job_in.idempotency_key}")
-        return existing_job
+        logger.info(f"Duplicate job submission for key: {job_in.idempotency_key}. Enforcement of fresh-session read.")
+        job_id = existing_job.id
+        # Close current session even if it would be handled by middleware, to ensures NO identity map issues
+        db.close()
+        
+        # Open a completely new session specifically for the response fetch
+        with database.SessionLocal() as fresh_db:
+            fresh_job = fresh_db.query(models.Job).filter(models.Job.id == job_id).one()
+            return fresh_job
 
     # 3. Create Job Record
     new_job = models.Job(
@@ -110,7 +120,7 @@ def submit_job(job_in: schemas.JobCreate, db: Session = Depends(database.get_db)
     elif new_job.priority <= 0:
         queue_name = "low_priority"
 
-    worker.celery_app.send_task(
+    celery_app.send_task(
         "process_job",
         args=[str(new_job.id)],
         queue=queue_name
@@ -160,7 +170,7 @@ def replay_job(job_id: str, db: Session = Depends(database.get_db)):
     elif job.priority <= 0:
         queue_name = "low_priority"
 
-    worker.celery_app.send_task(
+    celery_app.send_task(
         "process_job",
         args=[str(job.id)],
         queue=queue_name
