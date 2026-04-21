@@ -1,4 +1,4 @@
-from app.celery_app import celery_app
+from app.worker import celery_app
 from app.database import SessionLocal
 from app.models import Job, JobStatus
 from datetime import datetime, timedelta

@@ -1,16 +1,18 @@
-from app.celery_app import celery_app
+from app.worker import celery_app
 from app.database import SessionLocal
 from app.models import Job, JobStatus, DeadLetterJob
 from datetime import datetime
 import time
 import logging
-import uuid
 
 logger = logging.getLogger(__name__)
 
 @celery_app.task(
     name="process_job",
     bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={'max_retries': 3},
     acks_late=True
 )
 def process_job(self, job_id: str):
@@ -21,11 +23,8 @@ def process_job(self, job_id: str):
     db_claim = SessionLocal()
     try:
         with db_claim.begin():
-            # Convert job_id string to UUID if necessary
-            actual_id = job_id if isinstance(job_id, uuid.UUID) else uuid.UUID(job_id)
-            
             job = db_claim.query(Job).filter(
-                Job.id == actual_id,
+                Job.id == job_id,
                 Job.status.in_([JobStatus.PENDING, JobStatus.RETRYING])
             ).with_for_update(skip_locked=True).first()
 
@@ -68,8 +67,7 @@ def process_job(self, job_id: str):
     db_finalize = SessionLocal()
     try:
         with db_finalize.begin():
-            actual_id = job_id if isinstance(job_id, uuid.UUID) else uuid.UUID(job_id)
-            job = db_finalize.query(Job).filter(Job.id == actual_id).first()
+            job = db_finalize.query(Job).filter(Job.id == job_id).first()
             if job:
                 job.status = JobStatus.SUCCESS
                 job.result = result
@@ -89,8 +87,7 @@ def handle_failure(self, job_id: str, exc: Exception, current_retry_count: int, 
     db_fail = SessionLocal()
     try:
         with db_fail.begin():
-            actual_id = job_id if isinstance(job_id, uuid.UUID) else uuid.UUID(job_id)
-            job = db_fail.query(Job).filter(Job.id == actual_id).first()
+            job = db_fail.query(Job).filter(Job.id == job_id).first()
             if job:
                 job.retry_count = current_retry_count + 1
                 job.updated_at = datetime.utcnow()

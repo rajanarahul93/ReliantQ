@@ -1,7 +1,8 @@
 import enum
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum, ForeignKey, Index, UUID
+from sqlalchemy import Column, String, Integer, DateTime, JSON, Enum, ForeignKey, Index
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -19,8 +20,8 @@ class Job(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     idempotency_key = Column(String, unique=True, nullable=False, index=True)
     task_type = Column(String, nullable=False)
-    payload = Column(JSON, nullable=False)
-    result = Column(JSON, nullable=True)
+    payload = Column(JSONB, nullable=False)
+    result = Column(JSONB, nullable=True)
     status = Column(Enum(JobStatus), default=JobStatus.PENDING, nullable=False)
     priority = Column(Integer, default=1)  # 0=Low, 1=Default, 2=High
     retry_count = Column(Integer, default=0)
