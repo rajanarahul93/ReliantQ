@@ -20,7 +20,7 @@ def reaper_task():
         stuck_jobs = db.query(Job).filter(
             Job.status == JobStatus.PROCESSING,
             Job.updated_at < timeout_threshold
-        ).all()
+        ).with_for_update().all()
         
         if not stuck_jobs:
             return f"No stuck jobs found. Cleaned up at {datetime.utcnow()}"

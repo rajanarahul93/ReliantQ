@@ -9,6 +9,7 @@ import logging
 import redis
 import uuid
 import time
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -74,58 +75,54 @@ def get_metrics(db: Session = Depends(database.get_db)):
     }
 
 @app.post("/v1/jobs", status_code=status.HTTP_201_CREATED, response_model=schemas.JobResponse)
-def submit_job(job_in: schemas.JobCreate, response: Response, db: Session = Depends(database.get_db)):
-    # 1. Backpressure Check
+def submit_job(job_in: schemas.JobCreate, response: Response):
+    # 1. Backpressure Check (Move before DB dependency to save connections)
     if get_queue_length() >= settings.MAX_QUEUE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Queue is full. Please try again later."
         )
 
-    # 2. Idempotency Check (Strict Fresh Read)
-    # Use one_or_none to search for existing job in the current session
-    existing_job = db.query(models.Job).filter(models.Job.idempotency_key == job_in.idempotency_key).one_or_none()
-    
-    if existing_job:
-        logger.info(f"Duplicate job submission for key: {job_in.idempotency_key}. Enforcement of fresh-session read.")
-        job_id = existing_job.id
-        # Close current session even if it would be handled by middleware, to ensures NO identity map issues
-        db.close()
+    # 2. Open DB Session
+    with database.SessionLocal() as db:
+        # 2. Idempotency Check (Strict Fresh Read)
+        # Use one_or_none to search for existing job in the current session
+        existing_job = db.query(models.Job).filter(models.Job.idempotency_key == job_in.idempotency_key).one_or_none()
         
-        # Open a completely new session specifically for the response fetch
-        with database.SessionLocal() as fresh_db:
-            fresh_job = fresh_db.query(models.Job).filter(models.Job.id == job_id).one()
+        if existing_job:
+            logger.info(f"Duplicate job submission for key: {job_in.idempotency_key}. Enforcement of fresh-session read.")
+            job_id = existing_job.id
             # Set status to 200 OK for idempotent return
             response.status_code = status.HTTP_200_OK
-            return fresh_job
+            return existing_job
 
-    # 3. Create Job Record
-    new_job = models.Job(
-        idempotency_key=job_in.idempotency_key,
-        task_type=job_in.task_type,
-        payload=job_in.payload,
-        priority=job_in.priority,
-        status=models.JobStatus.PENDING
-    )
-    db.add(new_job)
-    try:
-        db.commit()
-        db.refresh(new_job)
-    except IntegrityError:
-        db.rollback()
-        logger.warning(f"Race condition handled for key: {job_in.idempotency_key}")
-        # Use a fresh session to avoid any state issues after a rollback
-        with database.SessionLocal() as fresh_db:
-            existing = fresh_db.query(models.Job).filter(models.Job.idempotency_key == job_in.idempotency_key).first()
-            if existing:
-                response.status_code = status.HTTP_200_OK
-                return existing
-            # If still not found (very rare race like deletion), propagate the error
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="DB Collision Error")
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Failed to create job: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="DB Error")
+        # 3. Create Job Record
+        new_job = models.Job(
+            idempotency_key=job_in.idempotency_key,
+            task_type=job_in.task_type,
+            payload=job_in.payload,
+            priority=job_in.priority,
+            status=models.JobStatus.PENDING
+        )
+        db.add(new_job)
+        try:
+            db.commit()
+            db.refresh(new_job)
+        except IntegrityError:
+            db.rollback()
+            logger.warning(f"Race condition handled for key: {job_in.idempotency_key}")
+            # Use a fresh session to avoid any state issues after a rollback
+            with database.SessionLocal() as fresh_db:
+                existing = fresh_db.query(models.Job).filter(models.Job.idempotency_key == job_in.idempotency_key).first()
+                if existing:
+                    response.status_code = status.HTTP_200_OK
+                    return existing
+                # If still not found (very rare race like deletion), propagate the error
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="DB Collision Error")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to create job: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="DB Error")
 
     # 4. Enqueue Job
     queue_name = "default"

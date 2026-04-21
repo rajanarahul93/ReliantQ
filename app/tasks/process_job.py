@@ -5,13 +5,15 @@ from datetime import datetime
 import time
 import logging
 import uuid
+from celery.exceptions import Retry
 
 logger = logging.getLogger(__name__)
 
 @celery_app.task(
     name="process_job",
     bind=True,
-    acks_late=True
+    acks_late=True,
+    max_retries=3
 )
 def process_job(self, job_id: str):
     payload = None
@@ -111,7 +113,7 @@ def handle_failure(self, job_id: str, exc: Exception, current_retry_count: int, 
         # Trigger Celery retry mechanism
         raise self.retry(exc=exc)
     
-    except self.Retry:
+    except Retry:
         # Re-raise Celery's Retry exception so it reaches the worker
         raise
     except Exception as e:
@@ -120,10 +122,6 @@ def handle_failure(self, job_id: str, exc: Exception, current_retry_count: int, 
         db_fail.close()
 
 def simulate_task_execution(payload: dict):
-    """
-    Placeholder for actual task logic.
-    Uses plain dictionary passed from phase 1.
-    """
     # Simulate latency
     sleep_time = payload.get("simulate_sleep", 1)
     time.sleep(sleep_time)
