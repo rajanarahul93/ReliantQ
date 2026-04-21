@@ -1,6 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import select, insert, update
+from sqlalchemy.exc import IntegrityError
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from app import models, schemas, database
 from app.celery_app import celery_app
 from app.config import settings
@@ -73,7 +74,7 @@ def get_metrics(db: Session = Depends(database.get_db)):
     }
 
 @app.post("/v1/jobs", status_code=status.HTTP_201_CREATED, response_model=schemas.JobResponse)
-def submit_job(job_in: schemas.JobCreate, db: Session = Depends(database.get_db)):
+def submit_job(job_in: schemas.JobCreate, response: Response, db: Session = Depends(database.get_db)):
     # 1. Backpressure Check
     if get_queue_length() >= settings.MAX_QUEUE_SIZE:
         raise HTTPException(
@@ -94,6 +95,8 @@ def submit_job(job_in: schemas.JobCreate, db: Session = Depends(database.get_db)
         # Open a completely new session specifically for the response fetch
         with database.SessionLocal() as fresh_db:
             fresh_job = fresh_db.query(models.Job).filter(models.Job.id == job_id).one()
+            # Set status to 200 OK for idempotent return
+            response.status_code = status.HTTP_200_OK
             return fresh_job
 
     # 3. Create Job Record
@@ -108,10 +111,21 @@ def submit_job(job_in: schemas.JobCreate, db: Session = Depends(database.get_db)
     try:
         db.commit()
         db.refresh(new_job)
+    except IntegrityError:
+        db.rollback()
+        logger.warning(f"Race condition handled for key: {job_in.idempotency_key}")
+        # Use a fresh session to avoid any state issues after a rollback
+        with database.SessionLocal() as fresh_db:
+            existing = fresh_db.query(models.Job).filter(models.Job.idempotency_key == job_in.idempotency_key).first()
+            if existing:
+                response.status_code = status.HTTP_200_OK
+                return existing
+            # If still not found (very rare race like deletion), propagate the error
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="DB Collision Error")
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to create job: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER__ERROR, detail="DB Error")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="DB Error")
 
     # 4. Enqueue Job
     queue_name = "default"
